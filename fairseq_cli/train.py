@@ -39,11 +39,12 @@ def main(args, init_distributed=False):
     assert args.max_tokens is not None or args.max_sentences is not None, \
         'Must specify batch size either with --max-tokens or --max-sentences'
 
-    # Initialize CUDA and distributed training
-    if torch.cuda.is_available() and not args.cpu:
-        torch.cuda.set_device(args.device_id)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    # Initialize CUDA and distributed training
+    if torch.cuda.is_available() and not args.cpu and not args.tpu:
+        torch.cuda.set_device(args.device_id)
     if init_distributed:
         args.distributed_rank = distributed_utils.distributed_init(args)
 
@@ -144,6 +145,14 @@ def should_stop_early(args, valid_loss):
         return should_stop_early.num_runs > args.patience
 
 
+def tpu_data_loader(args, itr):
+    import torch_xla.distributed.parallel_loader as pl
+    device = utils.get_tpu_device(args)
+    itr_len = len(itr)
+    itr = pl.ParallelLoader(itr, [device]).per_device_loader(device)
+    return iterators.CountingIterator(itr, override_len=itr_len)
+
+
 @metrics.aggregate('train')
 def train(args, trainer, task, epoch_itr):
     """Train the model for one epoch."""
@@ -158,6 +167,8 @@ def train(args, trainer, task, epoch_itr):
         else args.update_freq[-1]
     )
     itr = iterators.GroupedIterator(itr, update_freq)
+    if args.tpu:
+        itr = tpu_data_loader(args, itr)
     progress = progress_bar.build_progress_bar(
         args, itr, epoch_itr.epoch, no_progress_bar='simple',
     )
@@ -198,8 +209,6 @@ def train(args, trainer, task, epoch_itr):
 
 
 def get_training_stats(stats):
-    if 'nll_loss' in stats and 'ppl' not in stats:
-        stats['ppl'] = utils.get_perplexity(stats['nll_loss'])
     stats['wall'] = round(metrics.get_meter('default', 'wall').elapsed_time, 0)
     return stats
 
@@ -229,6 +238,8 @@ def validate(args, trainer, task, epoch_itr, subsets):
             shard_id=args.distributed_rank,
             num_workers=args.num_workers,
         ).next_epoch_itr(shuffle=False)
+        if args.tpu:
+            itr = tpu_data_loader(args, itr)
         progress = progress_bar.build_progress_bar(
             args, itr, epoch_itr.epoch,
             prefix='valid on \'{}\' subset'.format(subset),
@@ -250,8 +261,6 @@ def validate(args, trainer, task, epoch_itr, subsets):
 
 
 def get_valid_stats(args, trainer, stats):
-    if 'nll_loss' in stats and 'ppl' not in stats:
-        stats['ppl'] = utils.get_perplexity(stats['nll_loss'])
     stats['num_updates'] = trainer.get_num_updates()
     if hasattr(checkpoint_utils.save_checkpoint, 'best'):
         key = 'best_{0}'.format(args.best_checkpoint_metric)
@@ -290,18 +299,26 @@ def cli_main(modify_parser=None):
         else:
             distributed_main(args.device_id, args)
     elif args.distributed_world_size > 1:
-        # fallback for single node with multiple GPUs
-        assert args.distributed_world_size <= torch.cuda.device_count()
-        port = random.randint(10000, 20000)
-        args.distributed_init_method = 'tcp://localhost:{port}'.format(port=port)
-        args.distributed_rank = None  # set based on device id
-        if max(args.update_freq) > 1 and args.ddp_backend != 'no_c10d':
-            logger.info('NOTE: you may get faster training with: --ddp-backend=no_c10d')
-        torch.multiprocessing.spawn(
-            fn=distributed_main,
-            args=(args, ),
-            nprocs=args.distributed_world_size,
-        )
+        if not args.tpu:
+            # fallback for single node with multiple GPUs
+            assert args.distributed_world_size <= torch.cuda.device_count()
+            port = random.randint(10000, 20000)
+            args.distributed_init_method = 'tcp://localhost:{port}'.format(port=port)
+            args.distributed_rank = None  # set based on device id
+            if max(args.update_freq) > 1 and args.ddp_backend != 'no_c10d':
+                logger.info('NOTE: you may get faster training with: --ddp-backend=no_c10d')
+            torch.multiprocessing.spawn(
+                fn=distributed_main,
+                args=(args, ),
+                nprocs=args.distributed_world_size,
+            )
+        else:
+            import torch_xla.distributed.xla_multiprocessing as xmp
+            xmp.spawn(
+                fn=distributed_main,
+                args=(args, ),
+                nprocs=8,  # use all 8 TPU cores
+            )
     else:
         # single GPU training
         main(args)
